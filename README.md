@@ -1,9 +1,10 @@
 # mame-guess
+
 A small tool to guess the proper MAME version for a zipped ROM.
 
 ## Usage
 
-Run it like:
+Clone this repository, properly symlink the `mame-guess` executable inside, and then run it like:
 
 ```shell
 mame-guess some-game.zip
