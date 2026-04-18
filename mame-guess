@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+mame_core_picker.py
+Recommends the correct MAME libretro core for a given ROM zip file
+by matching its contents against DAT/XML files.
+
+Usage:
+    python3 mame_core_picker.py <rom.zip> <dat_folder>
+
+Example:
+    python3 mame_core_picker.py dino.zip ~/dats/
+"""
+
+import sys
+import os
+import zipfile
+import xml.etree.ElementTree as ET
+
+# ── Core definitions ──────────────────────────────────────────────────────────
+# Order matters: checked from most specific/oldest to newest.
+# mame_libretro.so is the fallback (last).
+CORES = [
+    {
+        "core":    "mame2000_libretro.so",
+        "dat":     "mame2000.xml",
+        "label":   "MAME 2000 (0.37b5)",
+    },
+    {
+        "core":    "mame2003_libretro.so",
+        "dat":     "mame2003.xml",
+        "label":   "MAME 2003 (0.78)",
+    },
+    {
+        "core":    "mame2003_plus_libretro.so",
+        "dat":     "mame2003-plus.xml",
+        "label":   "MAME 2003-Plus (0.78+)",
+    },
+    {
+        "core":    "mame2010_libretro.so",
+        "dat":     "mame2010.xml",
+        "label":   "MAME 2010 (0.139)",
+    },
+    {
+        "core":    "mame_libretro.so",
+        "dat":     "mame.xml",
+        "label":   "MAME Current (latest)",
+    },
+]
+
+DEFAULT_CORE = "mame_libretro.so"
+
+
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def get_rom_name(zip_path):
+    """Returns the ROM set name (zip filename without extension, lowercased)."""
+    return os.path.splitext(os.path.basename(zip_path))[0].lower()
+
+
+def get_zip_filenames(zip_path):
+    """Returns a set of filenames contained inside the zip."""
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        return {info.filename.lower() for info in zf.infolist()}
+
+
+def load_dat(dat_path, rom_name):
+    """
+    Parses a MAME XML DAT file and returns the set of expected filenames
+    for the given rom_name, or None if the game isn't listed in that DAT.
+
+    Supports both:
+      - <game name="...">  (older DAT format)
+      - <machine name="...">  (newer DAT format)
+    """
+    try:
+        tree = ET.parse(dat_path)
+    except ET.ParseError as e:
+        print(f"  WARNING: Could not parse {dat_path}: {e}", file=sys.stderr)
+        return None
+
+    root = tree.getroot()
+
+    # Support both <game> and <machine> tags
+    for tag in ("game", "machine"):
+        for entry in root.iter(tag):
+            if entry.get("name", "").lower() == rom_name:
+                roms = {
+                    rom.get("name", "").lower()
+                    for rom in entry.iter("rom")
+                    if rom.get("name")
+                }
+                return roms
+
+    return None  # Game not found in this DAT
+
+
+def match_score(zip_files, dat_files):
+    """
+    Returns a float 0.0–1.0 representing how well the zip matches the DAT entry.
+    1.0 = perfect match, 0.0 = no overlap.
+    """
+    if not dat_files:
+        return 0.0
+    overlap = zip_files & dat_files
+    # Score: harmonic-style — penalise both missing and extra files
+    precision = len(overlap) / len(zip_files) if zip_files else 0.0
+    recall    = len(overlap) / len(dat_files)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def main():
+    # ── Argument validation ───────────────────────────────────────────────────
+    if len(sys.argv) != 3:
+        print(f"Usage: {sys.argv[0]} <rom.zip>")
+        sys.exit(1)
+
+    zip_path   = sys.argv[1]
+    dat_folder = os.path.dirname(__file__)
+
+    if not os.path.isfile(zip_path):
+        die(f"ROM zip not found: {zip_path}")
+
+    if not zipfile.is_zipfile(zip_path):
+        die(f"Not a valid zip file: {zip_path}")
+
+    # ── Load zip contents ─────────────────────────────────────────────────────
+    rom_name  = get_rom_name(zip_path)
+    zip_files = get_zip_filenames(zip_path)
+
+    if not zip_files:
+        die("The zip file is empty.")
+
+    # ── Match against each DAT ────────────────────────────────────────────────
+    best_core  = DEFAULT_CORE
+    best_score = -1.0
+
+    for core_def in CORES:
+        dat_path = os.path.join(dat_folder, core_def["dat"])
+
+        if not os.path.isfile(dat_path):
+            # DAT not available locally, skip silently
+            continue
+
+        dat_files = load_dat(dat_path, rom_name)
+
+        if dat_files is None:
+            # Game not listed in this DAT
+            continue
+
+        score = match_score(zip_files, dat_files)
+
+        if score > best_score:
+            best_score = score
+            best_core  = core_def["core"]
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    print(best_core)
+
+
+if __name__ == "__main__":
+    main()
