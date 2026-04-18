@@ -13,6 +13,7 @@ Example:
 
 import sys
 import os
+import json
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -56,45 +57,134 @@ def die(msg):
 
 
 def get_rom_name(zip_path):
-    """Returns the ROM set name (zip filename without extension, lowercased)."""
+    """
+    Returns the ROM set name (zip filename without extension, lowercased).
+    """
+
     return os.path.splitext(os.path.basename(zip_path))[0].lower()
 
 
 def get_zip_filenames(zip_path):
-    """Returns a set of filenames contained inside the zip."""
+    """
+    Returns a set of filenames contained inside the zip.
+    """
+
     with zipfile.ZipFile(zip_path, "r") as zf:
         return {info.filename.lower() for info in zf.infolist()}
+
+
+def get_cache_dir():
+    """
+    Returns the cache directory used for DAT indexes.
+    """
+
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    if not cache_home:
+        cache_home = os.path.join(os.path.expanduser("~"), ".cache")
+    cache_dir = os.path.join(cache_home, "mame-guess")
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def get_cache_path(dat_path):
+    """
+    Returns the cache file path for a DAT file.
+    """
+
+    dat_name = os.path.basename(dat_path)
+    return os.path.join(get_cache_dir(), f"{dat_name}.index.json")
+
+
+def build_dat_index(dat_path):
+    """
+    Builds a rom_name -> rom filenames index by streaming the DAT file once.
+    This avoids loading the entire XML tree into memory while indexing.
+    """
+
+    entries = {}
+
+    try:
+        context = ET.iterparse(dat_path, events=("end",))
+        for _, elem in context:
+            if elem.tag not in ("game", "machine"):
+                continue
+
+            rom_name = elem.get("name", "").lower()
+            if rom_name:
+                roms = {
+                    rom.get("name", "").lower()
+                    for rom in elem.iter("rom")
+                    if rom.get("name")
+                }
+                entries[rom_name] = sorted(roms)
+
+            elem.clear()
+    except ET.ParseError as e:
+        print(f"  WARNING: Could not parse {dat_path}: {e}", file=sys.stderr)
+        return None
+
+    return entries
+
+
+def load_or_build_dat_index(dat_path):
+    """
+    Loads a cached DAT index or rebuilds it if the DAT has changed.
+    """
+
+    cache_path = get_cache_path(dat_path)
+    dat_stat = os.stat(dat_path)
+
+    try:
+        with open(cache_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if (
+            payload.get("source_size") == dat_stat.st_size
+            and payload.get("source_mtime_ns") == dat_stat.st_mtime_ns
+        ):
+            return payload.get("entries", {})
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    entries = build_dat_index(dat_path)
+    if entries is None:
+        return None
+
+    payload = {
+        "source_size": dat_stat.st_size,
+        "source_mtime_ns": dat_stat.st_mtime_ns,
+        "entries": entries,
+    }
+    tmp_path = f"{cache_path}.tmp"
+
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, separators=(",", ":"))
+        os.replace(tmp_path, cache_path)
+    except OSError:
+        # A cache write failure should not block lookups.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    return entries
 
 
 def load_dat(dat_path, rom_name):
     """
     Parses a MAME XML DAT file and returns the set of expected filenames
     for the given rom_name, or None if the game isn't listed in that DAT.
-
-    Supports both:
-      - <game name="...">  (older DAT format)
-      - <machine name="...">  (newer DAT format)
     """
-    try:
-        tree = ET.parse(dat_path)
-    except ET.ParseError as e:
-        print(f"  WARNING: Could not parse {dat_path}: {e}", file=sys.stderr)
+
+    entries = load_or_build_dat_index(dat_path)
+    if entries is None:
         return None
 
-    root = tree.getroot()
+    dat_files = entries.get(rom_name)
+    if dat_files is None:
+        return None
 
-    # Support both <game> and <machine> tags
-    for tag in ("game", "machine"):
-        for entry in root.iter(tag):
-            if entry.get("name", "").lower() == rom_name:
-                roms = {
-                    rom.get("name", "").lower()
-                    for rom in entry.iter("rom")
-                    if rom.get("name")
-                }
-                return roms
-
-    return None  # Game not found in this DAT
+    return set(dat_files)
 
 
 def match_score(zip_files, dat_files):
@@ -102,6 +192,7 @@ def match_score(zip_files, dat_files):
     Returns a float 0.0–1.0 representing how well the zip matches the DAT entry.
     1.0 = perfect match, 0.0 = no overlap.
     """
+
     if not dat_files:
         return 0.0
     overlap = zip_files & dat_files
